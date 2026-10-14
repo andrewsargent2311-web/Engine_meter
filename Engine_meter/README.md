@@ -5,10 +5,11 @@ nRF52840 (nice!nano) engine meter -- RPM + EGT/CHT over BLE (Nordic UART) to the
 1. Install the **PlatformIO IDE** extension.
 2. File > Open Folder... > select this `Engine_meter` folder.
 3. Build: PlatformIO sidebar > `nicenano` > General > Build (or Ctrl+Alt+B).
-4. To upload, double-tap the nice!nano's reset button to enter its bootloader,
-   then start PlatformIO Upload. The bootloader appears as a separate USB serial
-   COM port (`VID_239A&PID_00B3`); upload must target that port, not the running
-   firmware's COM port.
+4. Start PlatformIO Upload; PlatformIO will try to reset the nice!nano into its
+   bootloader automatically. If the upload hangs or fails, double-tap the reset
+   button to enter the bootloader manually and retry. The bootloader appears as
+   a separate USB serial COM port (`VID_239A&PID_00B3`); upload must target that
+   port, not the running firmware's COM port.
 5. To monitor, open the running firmware's COM port at 115200 baud. Start the
    monitor, then reset or reconnect the board to catch the startup message.
    Firmware waits up to 10 seconds for USB serial at boot; it continues running

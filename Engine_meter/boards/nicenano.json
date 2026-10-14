@@ -62,6 +62,8 @@
     "maximum_size": 815104,
     "speed": 115200,
     "protocol": "nrfutil",
+    "use_1200bps_touch": true,
+    "wait_for_upload_port": true,
     "protocols": [
       "jlink",
       "nrfjprog",
