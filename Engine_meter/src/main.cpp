@@ -14,17 +14,13 @@
 // Pin mapping traced from Engine_monitor_V1.kicad_sch. Adafruit's nRF52
 // core numbers digital pins as: P0.xx -> pin xx, P1.xx -> pin (32+xx).
 //
-// *** CONTAINS TEMPORARY TEST CODE ***
-// Search this file for "TEST CODE" -- there's a simulation mode that
-// kicks in if no real RPM/CHT signal shows up within 45s of boot, so you
-// can bench-test the BLE link to the vario without an engine attached.
-// Delete it once real hardware is verified working.
 // =====================================================================
 
 #include <Arduino.h>   // required in PlatformIO (.ino files get this added automatically)
 #include <bluefruit.h>
 #include <SPI.h>
 #include <Adafruit_MAX31856.h>
+#include "AuxSensors.h"
 
 // ---------------------------------------------------------------------
 // PINS (from schematic global labels)
@@ -101,7 +97,7 @@ float readRpm() {
 
 // ---------------------------------------------------------------------
 // OUTGOING PACKET FORMAT
-// Fixed 9-byte layout, well under the default ~20 byte NUS notify MTU.
+// Fixed 10-byte layout, well under the default ~20 byte NUS notify MTU.
 // This is a starting-point protocol -- change it freely, just keep the
 // ESP32-side decoder (which you'll add in bleReadLatestEngineData()'s
 // caller / drawParamotorPage()) in sync with whatever you settle on.
@@ -111,13 +107,14 @@ float readRpm() {
 //   byte 3-4  : int16_t  EGT, little-endian, in 0.1 degC units
 //   byte 5-6  : int16_t  CHT, little-endian, in 0.1 degC units
 //   byte 7    : status flags (bit0 = EGT fault, bit1 = CHT fault)
-//   byte 8    : checksum = XOR of bytes 0..7
+//   byte 8    : battery percentage (0-100)
+//   byte 9    : checksum = XOR of bytes 0..8
 // ---------------------------------------------------------------------
 #define PKT_HEADER 0xAE
 
 void sendEnginePacket(float rpm, float egtC, bool egtFault,
-                       float chtC, bool chtFault) {
-  uint8_t pkt[9];
+                       float chtC, bool chtFault, uint8_t batteryPercent) {
+  uint8_t pkt[10];
   uint16_t rpmVal = (uint16_t)constrain(rpm, 0, 65535);
   int16_t egtVal = (int16_t)constrain(egtC * 10.0f, -3000, 30000);
   int16_t chtVal = (int16_t)constrain(chtC * 10.0f, -3000, 30000);
@@ -130,10 +127,11 @@ void sendEnginePacket(float rpm, float egtC, bool egtFault,
   pkt[5] = (uint8_t)(chtVal & 0xFF);
   pkt[6] = (uint8_t)(chtVal >> 8);
   pkt[7] = (egtFault ? 0x01 : 0x00) | (chtFault ? 0x02 : 0x00);
+  pkt[8] = batteryPercent;
 
   uint8_t chk = 0;
-  for (int i = 0; i < 8; i++) chk ^= pkt[i];
-  pkt[8] = chk;
+  for (int i = 0; i < 9; i++) chk ^= pkt[i];
+  pkt[9] = chk;
 
   if (Bluefruit.connected()) {
     bleuart.write(pkt, sizeof(pkt));
@@ -169,62 +167,18 @@ void startAdv() {
   Bluefruit.Advertising.start(0);              // 0 = never stop advertising
 }
 
-// =====================================================================
-// ############################  TEST CODE  ############################
-// SIMULATION MODE -- FOR BENCH TESTING ONLY, DELETE THIS WHOLE BLOCK
-// (and the two call-outs to it in loop(), each marked the same way)
-// BEFORE FLYING.
-//
-// If 45 seconds pass after boot with no real RPM pulses AND the CHT
-// thermocouple channel is faulted (i.e. nothing's actually wired up --
-// the normal state while this board is sitting on a bench away from an
-// engine), this switches to feeding the ESP32 a fake but plausible-
-// looking data stream instead of real sensor readings. The only point
-// is to prove the BLE link and packet decode work end-to-end on the
-// vario's Paramotor page without needing an engine running. It does NOT
-// touch real sensor logic -- once you plug in a real pickup/thermocouple
-// this condition never triggers and the board behaves exactly as before.
-// =====================================================================
-#define SIM_TRIGGER_DELAY_MS   45000UL
-bool simulationMode = false;
 
-void maybeEnterSimulationMode(float realRpm, bool realChtFault) {
-  if (simulationMode) return;
-  if (millis() < SIM_TRIGGER_DELAY_MS) return;
-  if (realRpm > 0.0f || !realChtFault) return;  // real hardware looks present -- leave it alone
-
-  simulationMode = true;
-  Serial.println("[TEST] No RPM pulses / no CHT thermocouple detected after 45s -- "
-                  "entering SIMULATION MODE (fake test data). "
-                  "REMOVE maybeEnterSimulationMode()/generateSimulatedData() before flying!");
-}
-
-// Triangle-wave RPM (idle <-> redline over ~20s) and sine-wave CHT/EGT
-// (over ~60s) -- just needs to move around convincingly on the display,
-// doesn't need to be physically realistic.
-void generateSimulatedData(float& rpm, float& egtC, bool& egtFault,
-                            float& chtC, bool& chtFault) {
-  const float RPM_MIN = 1200.0f, RPM_MAX = 6500.0f, RPM_PERIOD_MS = 20000.0f;
-  float rpmPhase = fmodf(millis(), RPM_PERIOD_MS) / RPM_PERIOD_MS;  // 0..1
-  float rpmTri = (rpmPhase < 0.5f) ? (rpmPhase * 2.0f) : (2.0f - rpmPhase * 2.0f);  // triangle 0..1..0
-  rpm = RPM_MIN + rpmTri * (RPM_MAX - RPM_MIN);
-
-  const float CHT_MIN = 70.0f, CHT_MAX = 150.0f, CHT_PERIOD_MS = 60000.0f;
-  float chtSine = (sinf(2.0f * PI * millis() / CHT_PERIOD_MS) + 1.0f) / 2.0f;  // 0..1
-  chtC = CHT_MIN + chtSine * (CHT_MAX - CHT_MIN);
-  chtFault = false;
-
-  const float EGT_MIN = 300.0f, EGT_MAX = 650.0f;
-  egtC = EGT_MIN + chtSine * (EGT_MAX - EGT_MIN);  // rides the same phase as CHT, close enough
-  egtFault = false;
-}
-// ##########################  END TEST CODE  ##########################
 
 void setup() {
   Serial.begin(115200);
-  // Uncomment while debugging on USB power if you want to see setup
-  // logs before the vario is nearby to connect to:
-  // while (!Serial) delay(10);
+  // Give the USB CDC monitor time to attach, but don't block normal use.
+  const uint32_t serialWaitStart = millis();
+  while (!Serial && millis() - serialWaitStart < 10000) {
+    delay(10);
+  }
+  Serial.println("[BOOT] USB serial ready; initializing engine meter");
+
+  beginAuxSensors();
 
   // ---- RPM input ----
   pinMode(PIN_RPM, INPUT);  // external 10k pull-up (R8) already on board
@@ -266,21 +220,13 @@ void loop() {
     uint8_t chtFaultBits = maxCHT.readFault();
     bool chtFault = (chtFaultBits != 0);
 
-    // ---- TEST CODE: delete this call along with the block it calls
-    // (maybeEnterSimulationMode/generateSimulatedData above) once you're
-    // done bench-testing the BLE link. See the block comment above for
-    // what this does and why. ----
-    maybeEnterSimulationMode(rpm, chtFault);
-    if (simulationMode) {
-      generateSimulatedData(rpm, egtC, egtFault, chtC, chtFault);
-    }
-    // ---- END TEST CODE ----
+    uint8_t batteryPercent = readBatteryPercent();
 
-    sendEnginePacket(rpm, egtC, egtFault, chtC, chtFault);
+    sendEnginePacket(rpm, egtC, egtFault, chtC, chtFault, batteryPercent);
 
-    Serial.printf("RPM=%.0f  EGT=%.1fC%s  CHT=%.1fC%s%s\n",
+    Serial.printf("RPM=%.0f  EGT=%.1fC%s  CHT=%.1fC%s  BAT=%u%%\n",
                   rpm, egtC, egtFault ? " [FAULT]" : "",
                   chtC, chtFault ? " [FAULT]" : "",
-                  simulationMode ? "  [SIMULATED -- TEST DATA]" : "");
+                  batteryPercent);
   }
 }
