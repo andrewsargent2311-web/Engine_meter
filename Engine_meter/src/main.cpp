@@ -48,8 +48,10 @@
 #define RPM_TIMEOUT_MS         1500
 
 // The shortest real interval is about 6.9 ms at 8,700 RPM. Below that,
-// scale the lock-out to 40% of the last accepted period.
+// scale the lock-out to 40% of the last accepted period, but only when
+// that period is below 100 ms (> 600 RPM).
 #define RPM_MIN_LOCKOUT_US    5000
+#define RPM_MAX_ADAPT_US      100000
 
 // Capture raw interrupt edge intervals temporarily to diagnose pickup ringing.
 #define RPM_DEBUG_EDGES       1
@@ -90,17 +92,24 @@ void rpmISR() {
   uint32_t now = micros();
   uint32_t dt = now - lastPulseUs;
 
-  uint32_t lockout = (lastPeriodUs * 2) / 5;
-  if (lockout < RPM_MIN_LOCKOUT_US) lockout = RPM_MIN_LOCKOUT_US;
-
-  if (dt > lockout) {
-    lastPeriodUs = dt;
-    lastPulseUs = now;
-    lastPulseMillis = millis();
-    pulseCount++;
-  } else {
-    rejectCount++;
+  uint32_t lockout = RPM_MIN_LOCKOUT_US;
+  if (lastPeriodUs != 0 && lastPeriodUs < RPM_MAX_ADAPT_US) {
+    uint32_t adaptive = (lastPeriodUs * 2) / 5;
+    if (adaptive > lockout) lockout = adaptive;
   }
+
+  if (dt <= lockout) {
+    rejectCount++;
+    return;
+  }
+
+  // A gap longer than the timeout means the engine was stopped, so this is
+  // the first pulse of a new run and there is no valid period yet.
+  bool firstPulse = (dt > (uint32_t)RPM_TIMEOUT_MS * 1000UL);
+  lastPeriodUs = firstPulse ? 0 : dt;
+  lastPulseUs = now;
+  lastPulseMillis = millis();
+  pulseCount++;
 }
 
 float readRpm() {
