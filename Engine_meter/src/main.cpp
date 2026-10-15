@@ -30,7 +30,7 @@
 #define PIN_CS_EGT  36   // P1.04 -- MAX31856 #1 (EGT) chip select
 #define PIN_SCK     47   // P1.15 -- shared SPI clock
 #define PIN_SDI     45   // P1.13 -- MCU MOSI -> MAX31856 SDI (shared bus)
-#define PIN_RPM     43   // P1.11 -- comparator output (LMV331), pulled up by R8
+#define PIN_RPM     43   // P1.11 -- comparator output (LMV331), pulled up by R9
 
 // ---------------------------------------------------------------------
 // RPM CONFIG
@@ -45,6 +45,10 @@
 // If no pulse has arrived in this long, report RPM = 0 (engine off/stalled)
 // rather than showing a stale reading.
 #define RPM_TIMEOUT_MS         1500
+
+// Ignore edges closer together than this. Moster 185 tops out near 8,700 RPM
+// (~6.9 ms per rev), so 3 ms rejects spark ringing without hiding real pulses.
+#define RPM_LOCKOUT_US        3000
 
 // ---------------------------------------------------------------------
 // BLE -- Nordic UART Service, matching ble_manager.cpp on the ESP32 side
@@ -69,30 +73,29 @@ Adafruit_MAX31856 maxCHT(PIN_CS_CHT, PIN_SDI, PIN_SDO, PIN_SCK);
 volatile uint32_t lastPulseUs = 0;
 volatile uint32_t lastPeriodUs = 0;
 volatile uint32_t lastPulseMillis = 0;
+volatile uint32_t pulseCount = 0;      // debug: accepted pulses
 
 void rpmISR() {
   uint32_t now = micros();
   uint32_t period = now - lastPulseUs;
-  // Basic debounce: ignore pulses closer together than 1ms (would imply
-  // >30,000 RPM at 2 pulses/rev, well above anything realistic here).
-  if (period > 1000) {
+  if (period > RPM_LOCKOUT_US) {
     lastPeriodUs = period;
     lastPulseUs = now;
     lastPulseMillis = millis();
+    pulseCount++;
   }
 }
 
 float readRpm() {
   noInterrupts();
   uint32_t period = lastPeriodUs;
-  uint32_t sinceLastPulse = millis() - lastPulseMillis;
+  uint32_t lastMs = lastPulseMillis;
   interrupts();
 
-  if (lastPulseMillis == 0 || sinceLastPulse > RPM_TIMEOUT_MS || period == 0) {
+  if (lastMs == 0 || (millis() - lastMs) > RPM_TIMEOUT_MS || period == 0) {
     return 0.0f;
   }
-  float revsPerSec = (1000000.0f / period) / PULSES_PER_REV;
-  return revsPerSec * 60.0f;
+  return (1000000.0f / period) / PULSES_PER_REV * 60.0f;
 }
 
 // ---------------------------------------------------------------------
@@ -181,8 +184,8 @@ void setup() {
   beginAuxSensors();
 
   // ---- RPM input ----
-  pinMode(PIN_RPM, INPUT);  // external 10k pull-up (R8) already on board
-  attachInterrupt(digitalPinToInterrupt(PIN_RPM), rpmISR, FALLING);
+  pinMode(PIN_RPM, INPUT);  // external 10k pull-up (R9) already on board
+  attachInterrupt(digitalPinToInterrupt(PIN_RPM), rpmISR, RISING);
 
   // ---- Thermocouples ----
   maxEGT.begin();
@@ -224,8 +227,9 @@ void loop() {
 
     sendEnginePacket(rpm, egtC, egtFault, chtC, chtFault, batteryPercent);
 
-    Serial.printf("RPM=%.0f  EGT=%.1fC%s  CHT=%.1fC%s  BAT=%u%%\n",
-                  rpm, egtC, egtFault ? " [FAULT]" : "",
+    Serial.printf("RPM=%.0f  pulses=%lu  pin=%d  EGT=%.1fC%s  CHT=%.1fC%s  BAT=%u%%\n",
+                  rpm, (unsigned long)pulseCount, digitalRead(PIN_RPM),
+                  egtC, egtFault ? " [FAULT]" : "",
                   chtC, chtFault ? " [FAULT]" : "",
                   batteryPercent);
   }
