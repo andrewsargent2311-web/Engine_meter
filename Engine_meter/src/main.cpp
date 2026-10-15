@@ -17,6 +17,7 @@
 // =====================================================================
 
 #include <Arduino.h>   // required in PlatformIO (.ino files get this added automatically)
+#include <string.h>
 #include <bluefruit.h>
 #include <SPI.h>
 #include <Adafruit_MAX31856.h>
@@ -46,9 +47,12 @@
 // rather than showing a stale reading.
 #define RPM_TIMEOUT_MS         1500
 
-// Ignore edges closer together than this. Moster 185 tops out near 8,700 RPM
-// (~6.9 ms per rev), so 3 ms rejects spark ringing without hiding real pulses.
-#define RPM_LOCKOUT_US        3000
+// The shortest real interval is about 6.9 ms at 8,700 RPM. Below that,
+// scale the lock-out to 40% of the last accepted period.
+#define RPM_MIN_LOCKOUT_US    5000
+
+// Capture raw interrupt edge intervals temporarily to diagnose pickup ringing.
+#define RPM_DEBUG_EDGES       1
 
 // ---------------------------------------------------------------------
 // BLE -- Nordic UART Service, matching ble_manager.cpp on the ESP32 side
@@ -74,15 +78,28 @@ volatile uint32_t lastPulseUs = 0;
 volatile uint32_t lastPeriodUs = 0;
 volatile uint32_t lastPulseMillis = 0;
 volatile uint32_t pulseCount = 0;      // debug: accepted pulses
+volatile uint32_t rejectCount = 0;     // debug: rejected edges
+volatile uint32_t edgeUs[32];
+volatile uint8_t edgeN = 0;
 
 void rpmISR() {
+#if RPM_DEBUG_EDGES
+  if (edgeN < 32) edgeUs[edgeN++] = micros();
+#endif
+
   uint32_t now = micros();
-  uint32_t period = now - lastPulseUs;
-  if (period > RPM_LOCKOUT_US) {
-    lastPeriodUs = period;
+  uint32_t dt = now - lastPulseUs;
+
+  uint32_t lockout = (lastPeriodUs * 2) / 5;
+  if (lockout < RPM_MIN_LOCKOUT_US) lockout = RPM_MIN_LOCKOUT_US;
+
+  if (dt > lockout) {
+    lastPeriodUs = dt;
     lastPulseUs = now;
     lastPulseMillis = millis();
     pulseCount++;
+  } else {
+    rejectCount++;
   }
 }
 
@@ -210,6 +227,18 @@ void loop() {
   static uint32_t lastSend = 0;
   const uint32_t SEND_INTERVAL_MS = 200;  // 5 Hz telemetry
 
+#if RPM_DEBUG_EDGES
+  if (edgeN >= 32) {
+    uint32_t t[32];
+    noInterrupts();
+    memcpy(t, (const void*)edgeUs, sizeof(t));
+    edgeN = 0;
+    interrupts();
+    for (int i = 1; i < 32; i++) Serial.printf("%lu ", (unsigned long)(t[i] - t[i-1]));
+    Serial.println();
+  }
+#endif
+
   if (millis() - lastSend >= SEND_INTERVAL_MS) {
     lastSend = millis();
 
@@ -227,8 +256,9 @@ void loop() {
 
     sendEnginePacket(rpm, egtC, egtFault, chtC, chtFault, batteryPercent);
 
-    Serial.printf("RPM=%.0f  pulses=%lu  pin=%d  EGT=%.1fC%s  CHT=%.1fC%s  BAT=%u%%\n",
-                  rpm, (unsigned long)pulseCount, digitalRead(PIN_RPM),
+    Serial.printf("RPM=%.0f  pulses=%lu  rejects=%lu  pin=%d  EGT=%.1fC%s  CHT=%.1fC%s  BAT=%u%%\n",
+                  rpm, (unsigned long)pulseCount, (unsigned long)rejectCount,
+                  digitalRead(PIN_RPM),
                   egtC, egtFault ? " [FAULT]" : "",
                   chtC, chtFault ? " [FAULT]" : "",
                   batteryPercent);
