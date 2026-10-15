@@ -188,7 +188,11 @@ void startAdv() {
   Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
   Bluefruit.Advertising.addTxPower();
   Bluefruit.Advertising.addService(bleuart);
-  Bluefruit.Advertising.addName();
+  Bluefruit.Advertising.addName();  // only room for a shortened name ("ParaE") after flags+txpower+128-bit UUID
+
+  // Full name goes in the scan response so the vario's scanner shows
+  // "ParaEngineMeter" instead of the truncated version.
+  Bluefruit.ScanResponse.addName();
 
   Bluefruit.Advertising.restartOnDisconnect(true);
   Bluefruit.Advertising.setInterval(32, 244);  // in units of 0.625ms
