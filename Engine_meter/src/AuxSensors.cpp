@@ -2,10 +2,7 @@
 
 namespace {
 
-constexpr uint8_t PIN_VBAT = 4;  // P0.04 / AIN2 on the nice!nano
-constexpr float VBAT_DIV_RATIO = 0.713f;
 constexpr uint32_t BATTERY_SAMPLE_INTERVAL_MS = 5000;
-constexpr uint8_t ADC_SAMPLE_COUNT = 16;
 constexpr float BATTERY_FILTER_ALPHA = 0.25f;
 
 struct BatteryPoint {
@@ -26,15 +23,68 @@ uint8_t batteryPercent = 0;
 bool hasBatterySample = false;
 
 float readBatteryVolts() {
-  uint32_t adcTotal = 0;
-  for (uint8_t i = 0; i < ADC_SAMPLE_COUNT; ++i) {
-    adcTotal += analogRead(PIN_VBAT);
-    delay(2);
+  NRF_SAADC->ENABLE = SAADC_ENABLE_ENABLE_Disabled;
+  NRF_SAADC->RESOLUTION = SAADC_RESOLUTION_VAL_12bit;
+  NRF_SAADC->OVERSAMPLE = SAADC_OVERSAMPLE_OVERSAMPLE_Bypass;
+
+  NRF_SAADC->CH[0].CONFIG =
+      (SAADC_CH_CONFIG_BURST_Disabled << SAADC_CH_CONFIG_BURST_Pos) |
+      (SAADC_CH_CONFIG_MODE_SE << SAADC_CH_CONFIG_MODE_Pos) |
+      (SAADC_CH_CONFIG_TACQ_40us << SAADC_CH_CONFIG_TACQ_Pos) |
+      (SAADC_CH_CONFIG_REFSEL_Internal << SAADC_CH_CONFIG_REFSEL_Pos) |
+      (SAADC_CH_CONFIG_GAIN_Gain1_6 << SAADC_CH_CONFIG_GAIN_Pos) |
+      (SAADC_CH_CONFIG_RESN_Bypass << SAADC_CH_CONFIG_RESN_Pos) |
+      (SAADC_CH_CONFIG_RESP_Bypass << SAADC_CH_CONFIG_RESP_Pos);
+
+  NRF_SAADC->CH[0].PSELP = SAADC_CH_PSELP_PSELP_VDDHDIV5;
+  NRF_SAADC->CH[0].PSELN = SAADC_CH_PSELN_PSELN_NC;
+
+  for (int i = 1; i < 8; ++i) {
+    NRF_SAADC->CH[i].PSELP = SAADC_CH_PSELP_PSELP_NC;
   }
 
-  const float averageAdc = adcTotal / static_cast<float>(ADC_SAMPLE_COUNT);
-  const float adcVolts = averageAdc * (3600.0f / 4096.0f) / 1000.0f;
-  return adcVolts / VBAT_DIV_RATIO;
+  volatile int16_t adcBuffer = 0;
+  NRF_SAADC->RESULT.PTR = reinterpret_cast<uint32_t>(&adcBuffer);
+  NRF_SAADC->RESULT.MAXCNT = 1;
+
+  NRF_SAADC->ENABLE = SAADC_ENABLE_ENABLE_Enabled;
+  NRF_SAADC->EVENTS_CALIBRATEDONE = 0;
+  NRF_SAADC->TASKS_CALIBRATEOFFSET = 1;
+  while (!NRF_SAADC->EVENTS_CALIBRATEDONE) {
+  }
+
+  int32_t adcTotal = 0;
+  int validSamples = 0;
+  for (int i = 0; i < 10; ++i) {
+    NRF_SAADC->EVENTS_STARTED = 0;
+    NRF_SAADC->TASKS_START = 1;
+    while (!NRF_SAADC->EVENTS_STARTED) {
+    }
+
+    NRF_SAADC->EVENTS_END = 0;
+    NRF_SAADC->TASKS_SAMPLE = 1;
+    while (!NRF_SAADC->EVENTS_END) {
+    }
+
+    NRF_SAADC->EVENTS_STOPPED = 0;
+    NRF_SAADC->TASKS_STOP = 1;
+    while (!NRF_SAADC->EVENTS_STOPPED) {
+    }
+
+    if (adcBuffer > 0) {
+      adcTotal += adcBuffer;
+      ++validSamples;
+    }
+  }
+
+  NRF_SAADC->ENABLE = SAADC_ENABLE_ENABLE_Disabled;
+
+  if (validSamples == 0) {
+    return 0.0f;
+  }
+
+  const float averageAdc = adcTotal / static_cast<float>(validSamples);
+  return averageAdc * 18.0f / 4096.0f;
 }
 
 uint8_t voltageToPercent(float voltage) {
@@ -60,8 +110,6 @@ uint8_t voltageToPercent(float voltage) {
 }  // namespace
 
 void beginAuxSensors() {
-  analogReference(AR_INTERNAL);
-  analogReadResolution(12);
   lastBatterySampleMillis = millis() - BATTERY_SAMPLE_INTERVAL_MS;
 }
 
