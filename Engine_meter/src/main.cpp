@@ -1,10 +1,17 @@
 // =====================================================================
 // ENGINE METER firmware -- nice!nano (nRF52840)
 // Reads RPM (inductive pickup -> LMV331 comparator) + dual MAX31856
-// thermocouple channels (EGT + CHT), and streams the data over BLE
-// to the paraglide_vario_ESP32 flight computer using the Nordic UART
-// Service (NUS) -- the exact same service/characteristic the ESP32's
-// ble_manager.cpp already scans for and subscribes to.
+// thermocouple channels (EGT + CHT), and streams NMEA telemetry over BLE
+// using the Nordic UART Service (NUS) to Gaggle and the ESP32 vario.
+// EMS carries engine readings; PEMBAT carries battery percentage.
+// EMS fields after the identifier: pressure, fuel flow, fuel remaining,
+// fuel used, ambient temperature, CHT, EGT, water temperature, RPM.
+// Unused fields use 999999 (pressure), 9999 (fuel), or 99 (temperatures).
+// CHT/EGT are clamped to -300..1500 C and rounded degrees C x100 (99 means
+// unavailable); RPM is x100 (9999 means unavailable, and a computed 9999
+// is sent as 10000). $PEMBAT,<percent>*HH carries 0-100% battery and is
+// controlled by SEND_PEMBAT. Checksums are XOR as two uppercase hex digits;
+// sentences end in CRLF.
 //
 // Board: nice!nano (nRF52840), Adafruit nRF52 Arduino core
 // Build system: PlatformIO (VS Code) -- see platformio.ini in this folder.
@@ -17,6 +24,8 @@
 // =====================================================================
 
 #include <Arduino.h>   // required in PlatformIO (.ino files get this added automatically)
+#include <math.h>
+#include <stdio.h>
 #include <string.h>
 #include <bluefruit.h>
 #include <SPI.h>
@@ -124,47 +133,67 @@ float readRpm() {
   return (1000000.0f / period) / PULSES_PER_REV * 60.0f;
 }
 
-// ---------------------------------------------------------------------
-// OUTGOING PACKET FORMAT
-// Fixed 10-byte layout, well under the default ~20 byte NUS notify MTU.
-// This is a starting-point protocol -- change it freely, just keep the
-// ESP32-side decoder (which you'll add in bleReadLatestEngineData()'s
-// caller / drawParamotorPage()) in sync with whatever you settle on.
-//
-//   byte 0    : 0xAE  sync/header byte
-//   byte 1-2  : uint16_t RPM, little-endian
-//   byte 3-4  : int16_t  EGT, little-endian, in 0.1 degC units
-//   byte 5-6  : int16_t  CHT, little-endian, in 0.1 degC units
-//   byte 7    : status flags (bit0 = EGT fault, bit1 = CHT fault)
-//   byte 8    : battery percentage (0-100)
-//   byte 9    : checksum = XOR of bytes 0..8
-// ---------------------------------------------------------------------
-#define PKT_HEADER 0xAE
+#define SEND_PEMBAT 1
 
-void sendEnginePacket(float rpm, float egtC, bool egtFault,
-                       float chtC, bool chtFault, uint8_t batteryPercent) {
-  uint8_t pkt[10];
-  uint16_t rpmVal = (uint16_t)constrain(rpm, 0, 65535);
-  int16_t egtVal = (int16_t)constrain(egtC * 10.0f, -3000, 30000);
-  int16_t chtVal = (int16_t)constrain(chtC * 10.0f, -3000, 30000);
+void sendNmeaSentence(char* sentence, size_t capacity, int length) {
+  if (length <= 0 || static_cast<size_t>(length) >= capacity) {
+    return;
+  }
 
-  pkt[0] = PKT_HEADER;
-  pkt[1] = (uint8_t)(rpmVal & 0xFF);
-  pkt[2] = (uint8_t)(rpmVal >> 8);
-  pkt[3] = (uint8_t)(egtVal & 0xFF);
-  pkt[4] = (uint8_t)(egtVal >> 8);
-  pkt[5] = (uint8_t)(chtVal & 0xFF);
-  pkt[6] = (uint8_t)(chtVal >> 8);
-  pkt[7] = (egtFault ? 0x01 : 0x00) | (chtFault ? 0x02 : 0x00);
-  pkt[8] = batteryPercent;
+  char* checksumMarker = strchr(sentence, '*');
+  if (checksumMarker == nullptr || checksumMarker - sentence < 1 ||
+      checksumMarker[1] == '\0' || checksumMarker[2] == '\0') {
+    return;
+  }
 
-  uint8_t chk = 0;
-  for (int i = 0; i < 9; i++) chk ^= pkt[i];
-  pkt[9] = chk;
+  uint8_t checksum = 0;
+  for (const char* cursor = sentence + 1; cursor < checksumMarker; ++cursor) {
+    checksum ^= static_cast<uint8_t>(*cursor);
+  }
+
+  static const char HEX_DIGITS[] = "0123456789ABCDEF";
+  checksumMarker[1] = HEX_DIGITS[(checksum >> 4) & 0x0F];
+  checksumMarker[2] = HEX_DIGITS[checksum & 0x0F];
 
   if (Bluefruit.connected()) {
-    bleuart.write(pkt, sizeof(pkt));
+    bleuart.write(reinterpret_cast<const uint8_t*>(sentence), length);
   }
+}
+
+// Example outputs (checksum is XOR of bytes between '$' and '*'):
+// rpm=3100, CHT=180.0, EGT=550.0, no faults:
+// $EMS,999999,9999,9999,9999,99,18000,55000,99,310000*7C
+// CHT ok, EGT fault, rpm=3100:
+// $EMS,999999,9999,9999,9999,99,18000,99,99,310000*4C
+// Both faulted, rpm=0:
+// $EMS,999999,9999,9999,9999,99,99,99,99,0*47
+// Battery 85%: $PEMBAT,85*2E
+void sendEngineNmea(float rpm, float egtC, bool egtFault, float chtC,
+                    bool chtFault, uint8_t batteryPercent) {
+  const long chtValue =
+      chtFault || !isfinite(chtC)
+          ? 99
+          : lroundf(constrain(chtC, -300.0f, 1500.0f) * 100.0f);
+  const long egtValue =
+      egtFault || !isfinite(egtC)
+          ? 99
+          : lroundf(constrain(egtC, -300.0f, 1500.0f) * 100.0f);
+  long rpmValue = isfinite(rpm) && rpm > 0.0f ? lroundf(rpm * 100.0f) : 0;
+  if (rpmValue == 9999) {
+    rpmValue = 10000;
+  }
+
+  char sentence[96];
+  int length = snprintf(sentence, sizeof(sentence),
+                        "$EMS,999999,9999,9999,9999,99,%ld,%ld,99,%ld*00\r\n",
+                        chtValue, egtValue, rpmValue);
+  sendNmeaSentence(sentence, sizeof(sentence), length);
+
+#if SEND_PEMBAT
+  length = snprintf(sentence, sizeof(sentence), "$PEMBAT,%u*00\r\n",
+                    static_cast<unsigned int>(batteryPercent));
+  sendNmeaSentence(sentence, sizeof(sentence), length);
+#endif
 }
 
 // ---------------------------------------------------------------------
@@ -206,7 +235,7 @@ void setup() {
   Serial.begin(115200);
   // Give the USB CDC monitor time to attach, but don't block normal use.
   const uint32_t serialWaitStart = millis();
-  while (!Serial && millis() - serialWaitStart < 10000) {
+  while (!Serial && millis() - serialWaitStart < 1500) {
     delay(10);
   }
   Serial.println("[BOOT] USB serial ready; initializing engine meter");
@@ -224,6 +253,7 @@ void setup() {
   maxCHT.setThermocoupleType(MAX31856_TCTYPE_K);
 
   // ---- BLE ----
+  Bluefruit.configPrphConn(247, BLE_GAP_EVENT_LENGTH_DEFAULT, 8, 8);
   Bluefruit.begin();
   Bluefruit.setTxPower(4);
   Bluefruit.setName("ParaEngineMeter");  // shows up in the vario's BT scan list
@@ -267,7 +297,7 @@ void loop() {
 
     uint8_t batteryPercent = readBatteryPercent();
 
-    sendEnginePacket(rpm, egtC, egtFault, chtC, chtFault, batteryPercent);
+    sendEngineNmea(rpm, egtC, egtFault, chtC, chtFault, batteryPercent);
 
     Serial.printf("RPM=%.0f  pulses=%lu  rejects=%lu  pin=%d  EGT=%.1fC%s  CHT=%.1fC%s  BAT=%u%%\n",
                   rpm, (unsigned long)pulseCount, (unsigned long)rejectCount,

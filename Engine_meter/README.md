@@ -12,24 +12,36 @@ nRF52840 (nice!nano) engine meter -- RPM + EGT/CHT over BLE (Nordic UART) to the
    port, not the running firmware's COM port.
 5. To monitor, open the running firmware's COM port at 115200 baud. Start the
    monitor, then reset or reconnect the board to catch the startup message.
-   Firmware waits up to 10 seconds for USB serial at boot; it continues running
+   Firmware waits up to 1.5 seconds for USB serial at boot; it continues running
    if no monitor is connected and prints sensor readings every 200 ms.
 
 Firmware source is in `src/` (`main.cpp` and `AuxSensors.cpp` / `AuxSensors.h`).
 `Engine_meter.ino` is the original Arduino IDE version.
 
-## Battery telemetry
-The firmware samples battery voltage on P0.04 / AIN2 (pin 4), averages 16 ADC
-reads, and converts the result to an approximate single-cell LiPo percentage
-using a voltage curve. The configured divider ratio is 0.713; verify that the
-exact nice!nano module and board wiring use this ratio before relying on the
-reported percentage. Voltage-based state of charge is approximate and may be
-high while charging or sag under load.
+## BLE NMEA telemetry
+The nice!nano sends ASCII NMEA-style sentences through Nordic UART Service
+(NUS), with an XOR checksum over the bytes between `$` and `*` and CRLF line
+endings. Both Gaggle and the ESP32 vario consume this same text format:
 
-The Nordic UART packet is 10 bytes: the existing 9-byte telemetry packet has
-been extended with battery percentage (byte 8, 0-100), and the XOR checksum
-is now byte 9 and covers bytes 0-8. The BLE receiver must use this updated
-packet length and checksum position to decode the extended packet.
+- `$EMS,<pressure>,<fuelFlow>,<fuelRemaining>,<fuelUsed>,<ambientTemp>,<CHT>,<EGT>,<waterTemp>,<RPM>*HH\r\n`
+  has nine fields after `EMS`, in that order. Pressure is `999999`; fuel flow,
+  remaining, and used are `9999`; ambient and water temperatures are `99`.
+  CHT and EGT are rounded degrees C x 100, clamped to -300..1500 C; `99`
+  means unavailable (fault or non-finite reading). RPM is rounded RPM x 100;
+  `0` is a valid stopped-engine reading. Raw RPM `9999` is reserved as
+  unavailable, so a computed value of exactly `9999` is sent as `10000`.
+- `$PEMBAT,<percent>*HH\r\n` reports battery percentage from 0 to 100.
+  Sending it is controlled by `SEND_PEMBAT` in `src/main.cpp` (set it to `0`
+  if Gaggle objects to the proprietary sentence).
+
+Battery percentage is estimated from the nice!nano's internal nRF52840
+VDDHDIV5 ADC input and a single-cell LiPo voltage curve. Voltage-based state
+of charge is approximate and may read high while charging or sag under load.
+
+For Gaggle, add the meter through **Profile > Equipment > Bluetooth Devices**.
+Gaggle needs to receive a real supported reading within about 35 seconds;
+the `EMS` sentence supplies supported engine readings such as CHT, EGT, and
+RPM.
 
 ## Board definition
 `nicenano` isn't built into PlatformIO, so `boards/nicenano.json` and `boards/nicenano/` (pin variant)
