@@ -9,9 +9,11 @@
 // Unused fields use 999999 (pressure), 9999 (fuel), or 99 (temperatures).
 // CHT/EGT are clamped to -300..1500 C and rounded degrees C x100 (99 means
 // unavailable); RPM is x100 (9999 means unavailable, and a computed 9999
-// is sent as 10000). $PEMBAT,<percent>*HH carries 0-100% battery and is
-// controlled by SEND_PEMBAT. Checksums are XOR as two uppercase hex digits;
-// sentences end in CRLF.
+// is sent as 10000). RPM is a gated 5 s average with optional 1 s fast
+// attack on real RPM changes, rounded to 10 RPM with 7 RPM hysteresis.
+// RPM_TIMEOUT_MS reports zero immediately after a stop/stall. $PEMBAT,
+// <percent>*HH carries 0-100% battery and is controlled by SEND_PEMBAT.
+// Checksums are XOR as two uppercase hex digits; sentences end in CRLF.
 //
 // Board: nice!nano (nRF52840), Adafruit nRF52 Arduino core
 // Build system: PlatformIO (VS Code) -- see platformio.ini in this folder.
@@ -56,6 +58,15 @@
 // rather than showing a stale reading.
 #define RPM_TIMEOUT_MS         1500
 
+#define RPM_WINDOW_MS          5000   // averaging window
+#define RPM_SAMPLE_MS          200    // snapshot interval (= SEND_INTERVAL_MS)
+#define RPM_ROUND_TO           10     // round displayed RPM to this step
+#define RPM_HYST               7.0f   // hysteresis in RPM for display rounding
+#define RPM_FAST_ATTACK        1      // 1 = shrink window on real RPM change
+#define RPM_FAST_WINDOW_MS     1000
+#define RPM_FAST_THRESHOLD     0.10f  // 10% deviation triggers fast window
+#define RPM_HIST_LEN           (RPM_WINDOW_MS / RPM_SAMPLE_MS + 1)
+
 // The shortest real interval is about 6.9 ms at 8,700 RPM. Below that,
 // scale the lock-out to 40% of the last accepted period, but only when
 // that period is below 100 ms (> 600 RPM).
@@ -63,7 +74,7 @@
 #define RPM_MAX_ADAPT_US      100000
 
 // Capture raw interrupt edge intervals temporarily to diagnose pickup ringing.
-#define RPM_DEBUG_EDGES       1
+#define RPM_DEBUG_EDGES       0
 
 // ---------------------------------------------------------------------
 // BLE -- Nordic UART Service, matching ble_manager.cpp on the ESP32 side
@@ -81,17 +92,26 @@ Adafruit_MAX31856 maxEGT(PIN_CS_EGT, PIN_SDI, PIN_SDO, PIN_SCK);
 Adafruit_MAX31856 maxCHT(PIN_CS_CHT, PIN_SDI, PIN_SDO, PIN_SCK);
 
 // ---------------------------------------------------------------------
-// RPM: measured from the period between pulses (captured in an ISR),
-// not from a counted-pulses-per-window average -- this responds
-// immediately to RPM changes instead of lagging behind a sample window.
+// RPM: raw pulse periods are captured in the ISR; accepted-pulse snapshots
+// provide a gated average, with a short fast-attack window for RPM changes.
 // ---------------------------------------------------------------------
 volatile uint32_t lastPulseUs = 0;
 volatile uint32_t lastPeriodUs = 0;
 volatile uint32_t lastPulseMillis = 0;
-volatile uint32_t pulseCount = 0;      // debug: accepted pulses
+volatile uint32_t pulseCount = 0;      // accepted-pulse count for RPM averaging and diagnostics
 volatile uint32_t rejectCount = 0;     // debug: rejected edges
 volatile uint32_t edgeUs[32];
 volatile uint8_t edgeN = 0;
+
+struct RpmSnap {
+  uint32_t count;
+  uint32_t us;
+};
+
+static RpmSnap rpmHist[RPM_HIST_LEN];
+static uint8_t rpmHistHead = 0;  // next write index
+static uint8_t rpmHistN = 0;     // valid entries
+static float displayedRpm = 0.0f;
 
 void rpmISR() {
 #if RPM_DEBUG_EDGES
@@ -131,6 +151,74 @@ float readRpm() {
     return 0.0f;
   }
   return (1000000.0f / period) / PULSES_PER_REV * 60.0f;
+}
+
+float computeWindowedRpm(uint32_t windowMs) {
+  if (rpmHistN < 2) {
+    return 0.0f;
+  }
+
+  const uint8_t newestIndex =
+      static_cast<uint8_t>((rpmHistHead + RPM_HIST_LEN - 1) % RPM_HIST_LEN);
+  const uint32_t requestedBack = windowMs / RPM_SAMPLE_MS;
+  const uint8_t availableBack = static_cast<uint8_t>(rpmHistN - 1);
+  const uint8_t back = requestedBack < availableBack
+                           ? static_cast<uint8_t>(requestedBack)
+                           : availableBack;
+  const uint8_t oldestIndex =
+      static_cast<uint8_t>((newestIndex + RPM_HIST_LEN - back) % RPM_HIST_LEN);
+
+  const uint32_t dCount = rpmHist[newestIndex].count - rpmHist[oldestIndex].count;
+  const uint32_t dUs = rpmHist[newestIndex].us - rpmHist[oldestIndex].us;
+  if (dCount == 0 || dUs == 0) {
+    return 0.0f;
+  }
+
+  return (dCount * 1000000.0f / dUs) / PULSES_PER_REV * 60.0f;
+}
+
+float getSmoothedRpm() {
+  static uint32_t lastSampleMs = 0;
+  const uint32_t nowMs = millis();
+  if (nowMs - lastSampleMs >= RPM_SAMPLE_MS) {
+    lastSampleMs = nowMs;
+    RpmSnap snap;
+    noInterrupts();
+    snap.count = pulseCount;
+    snap.us = lastPulseUs;
+    interrupts();
+
+    rpmHist[rpmHistHead] = snap;
+    rpmHistHead = static_cast<uint8_t>((rpmHistHead + 1) % RPM_HIST_LEN);
+    if (rpmHistN < RPM_HIST_LEN) {
+      rpmHistN++;
+    }
+  }
+
+  if (readRpm() == 0.0f) {
+    rpmHistN = 0;
+    rpmHistHead = 0;
+    displayedRpm = 0.0f;
+    return 0.0f;
+  }
+
+  const float avgRpm = computeWindowedRpm(RPM_WINDOW_MS);
+  float smoothedRpm = avgRpm;
+#if RPM_FAST_ATTACK == 1
+  const float fastRpm = computeWindowedRpm(RPM_FAST_WINDOW_MS);
+  if (avgRpm > 0.0f &&
+      fabsf(fastRpm - avgRpm) / avgRpm > RPM_FAST_THRESHOLD) {
+    smoothedRpm = fastRpm;
+  }
+#endif
+
+  const float candidate =
+      roundf(smoothedRpm / RPM_ROUND_TO) * RPM_ROUND_TO;
+  if (fabsf(smoothedRpm - displayedRpm) >= RPM_HYST ||
+      displayedRpm == 0.0f || smoothedRpm == 0.0f) {
+    displayedRpm = candidate;
+  }
+  return displayedRpm;
 }
 
 #define SEND_PEMBAT 1
@@ -268,7 +356,7 @@ void setup() {
 
 void loop() {
   static uint32_t lastSend = 0;
-  const uint32_t SEND_INTERVAL_MS = 200;  // 5 Hz telemetry
+  const uint32_t SEND_INTERVAL_MS = RPM_SAMPLE_MS;  // 5 Hz telemetry
 
 #if RPM_DEBUG_EDGES
   if (edgeN >= 32) {
@@ -285,7 +373,8 @@ void loop() {
   if (millis() - lastSend >= SEND_INTERVAL_MS) {
     lastSend = millis();
 
-    float rpm = readRpm();
+    float rpm = getSmoothedRpm();
+    float rawRpm = readRpm();
 
     float egtC = maxEGT.readThermocoupleTemperature();
     uint8_t egtFaultBits = maxEGT.readFault();
@@ -299,8 +388,8 @@ void loop() {
 
     sendEngineNmea(rpm, egtC, egtFault, chtC, chtFault, batteryPercent);
 
-    Serial.printf("RPM=%.0f  pulses=%lu  rejects=%lu  pin=%d  EGT=%.1fC%s  CHT=%.1fC%s  BAT=%u%%\n",
-                  rpm, (unsigned long)pulseCount, (unsigned long)rejectCount,
+    Serial.printf("RPM=%.0f raw=%.0f  pulses=%lu  rejects=%lu  pin=%d  EGT=%.1fC%s  CHT=%.1fC%s  BAT=%u%%\n",
+                  rpm, rawRpm, (unsigned long)pulseCount, (unsigned long)rejectCount,
                   digitalRead(PIN_RPM),
                   egtC, egtFault ? " [FAULT]" : "",
                   chtC, chtFault ? " [FAULT]" : "",

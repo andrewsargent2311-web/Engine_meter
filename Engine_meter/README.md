@@ -43,6 +43,16 @@ Gaggle needs to receive a real supported reading within about 35 seconds;
 the `EMS` sentence supplies supported engine readings such as CHT, EGT, and
 RPM.
 
+### RPM filtering
+RPM is calculated from pulse-count snapshots taken every 200 ms and averaged
+over a gated 5-second window. A 1-second fast-attack window is enabled by
+default and is used when it differs from the 5-second average by more than
+10%, so real RPM changes are followed more quickly. The displayed value is
+rounded to the nearest 10 RPM with 7 RPM hysteresis to reduce flicker;
+`$EMS` carries that rounded RPM multiplied by 100. If no accepted pulse
+arrives within the 1.5-second stop timeout, RPM is reported as zero
+immediately and the averaging history is cleared so no decaying RPM remains.
+
 ## Board definition
 `nicenano` isn't built into PlatformIO, so `boards/nicenano.json` and `boards/nicenano/` (pin variant)
 are included and picked up via `board_build.variants_dir = boards` in `platformio.ini`.
